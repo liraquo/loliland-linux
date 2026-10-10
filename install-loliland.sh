@@ -36,6 +36,8 @@ cleanup() { [[ -z "${WORK:-}" ]] || rm -rf -- "$WORK"; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# set -e exits silently; say where it happened.
+trap 'die "Непредвиденная ошибка в строке $LINENO (код $?). Приложите это сообщение к issue."' ERR
 # download URL FILE [--progress-bar]; small files download silently.
 download() {
   curl --fail --location --proto '=https' --proto-redir '=https' \
@@ -112,13 +114,15 @@ unzip -p "$BUNDLE/launcher.jar" loliland/application/public/favicon.ico > "$WORK
 ico_u() { od -An -t "u$1" -j "$2" -N "$1" "$WORK/favicon.ico" | tr -d ' '; }
 COUNT="$(ico_u 2 4)"
 ENTRY=$((6 + 16 * (COUNT - 1)))
-tail -c +"$(( $(ico_u 4 $((ENTRY + 12))) + 1 ))" "$WORK/favicon.ico" | head -c "$(ico_u 4 $((ENTRY + 8)))" > "$BUNDLE/loliland.png"
+PNG_SIZE="$(ico_u 4 $((ENTRY + 8)))"
+# head reads the file itself and tail drains the pipe, so no SIGPIPE under pipefail.
+head -c "$(( $(ico_u 4 $((ENTRY + 12))) + PNG_SIZE ))" "$WORK/favicon.ico" | tail -c "$PNG_SIZE" > "$BUNDLE/loliland.png"
+ICON="$APP/loliland.png"
 if [[ "$(od -An -tx1 -N4 "$BUNDLE/loliland.png" | tr -d ' ')" != 89504e47 ]]; then
   rm -f "$BUNDLE/loliland.png"
   cp "$WORK/favicon.ico" "$BUNDLE/loliland.ico"
+  ICON="$APP/loliland.ico"
 fi
-ICON="$(ls "$BUNDLE"/loliland.png "$BUNDLE"/loliland.ico 2>/dev/null | head -1)"
-ICON="$APP/${ICON##*/}"
 
 printf 'Launcher source: %s/api/updater/load/launcher\nRuntime source: %s\nRuntime SHA-512: %s\n' \
   "$SOURCE" "$URL" "$ACTUAL" > "$BUNDLE/install-info.txt"
