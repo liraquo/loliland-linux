@@ -12,8 +12,7 @@ ok() { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
 [[ $EUID != 0 ]] || die 'Не запускайте установщик через sudo: LoliLand ставится для текущего пользователя.'
 SHARE="${XDG_DATA_HOME:-$HOME/.local/share}"
 APP="$SHARE/loliland-launcher"
-DESKTOP="$SHARE/applications/loliland.desktop"
-for tool in curl tar unzip sha512sum sha256sum od stat grep awk ps; do
+for tool in curl tar unzip sha512sum sha256sum stat grep awk ps; do
   command -v "$tool" >/dev/null || die "Не найдена системная утилита $tool. Установите её через пакетный менеджер (например, sudo pacman -S $tool или sudo apt install $tool)."
 done
 # Never replace the app while it is running.
@@ -22,7 +21,9 @@ check_old_app() {
   local procs; procs="$(ps -eo args=)"
   [[ "$procs" != *"$APP/"* ]] || die 'LoliLand сейчас запущен. Закройте его и повторите установку.'
 }
+mkdir -p "$SHARE/applications"
 check_old_app
+
 case "$(uname -m)" in
   x86_64) ARCH=x64 ;;
   aarch64|arm64) ARCH=aarch64 ;;
@@ -30,9 +31,8 @@ case "$(uname -m)" in
 esac
 
 # Work on the same filesystem; publish only a fully verified application.
-mkdir -p "$SHARE/applications"
 WORK="$(mktemp -d "$SHARE/.loliland-install.XXXXXX")"
-cleanup() { [[ -z "${WORK:-}" ]] || rm -rf -- "$WORK"; }
+cleanup() { rm -rf -- "$WORK"; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -51,25 +51,7 @@ SOURCE='https://klauncher.loliland.pro'
 BUNDLE="$WORK/loliland-launcher"
 mkdir -p "$BUNDLE/runtimes"
 printf '%sУстановщик LoliLand для Linux%s\n' "$B" "$N"
-step 1 'Лаунчер LoliLand'
-download "$SOURCE/api/updater/win64" "$WORK/manifest.json" \
-  || die 'Не удалось получить манифест LoliLand. Проверьте сеть и доступность сервера.'
-# The manifest is flat JSON: {"launcher":{"hash":"…","size":N},…}
-SIZE="$(grep -o '"launcher":{[^}]*}' "$WORK/manifest.json" | grep -o '"size":[0-9]*' | cut -d: -f2)" \
-  || die 'Сервер вернул некорректный манифест лаунчера.'
-[[ "$SIZE" =~ ^[0-9]+$ && "$SIZE" -gt 0 ]] || die 'Некорректный размер лаунчера в манифесте.'
-ok 'Манифест получен'
-printf '  Скачиваю launcher.jar (%s МБ)…\n' "$((SIZE / 1048576))"
-download "$SOURCE/api/updater/load/launcher" "$BUNDLE/launcher.jar" --progress-bar \
-  || die 'Не удалось скачать launcher.jar. Проверьте сеть и доступность сервера.'
-[[ "$(stat -c %s "$BUNDLE/launcher.jar")" == "$SIZE" ]] || die 'Размер launcher.jar не совпадает с манифестом.'
-ok 'Размер совпадает с манифестом'
-unzip -tq "$BUNDLE/launcher.jar" >/dev/null || die 'Архив launcher.jar повреждён.'
-unzip -p "$BUNDLE/launcher.jar" META-INF/MANIFEST.MF | tr -d '\r' | grep -x 'Main-Class: loliland.launcher.app.Main' >/dev/null \
-  || die 'В JAR не найден основной класс лаунчера LoliLand.'
-ok 'Архив цел, лаунчер на месте'
-
-step 2 "Java (JetBrains Runtime с JCEF, $ARCH)"
+step 1 "Java (JetBrains Runtime с JCEF, $ARCH)"
 RUNTIME="jbr_jcef-17.0.11-linux-$ARCH-b1312.2"
 URL="https://cache-redirector.jetbrains.com/intellij-jbr/$RUNTIME.tar.gz"
 printf '  Скачиваю %s…\n' "$RUNTIME"
@@ -104,8 +86,9 @@ if [[ "$ARCH" == aarch64 ]]; then
   for module in lwjgl lwjgl-glfw lwjgl-openal lwjgl-opengl lwjgl-stb lwjgl-tinyfd lwjgl-xxhash; do
     JAR="$module-3.3.3-natives-linux-arm64.jar"
     LURL="https://repo1.maven.org/maven2/org/lwjgl/$module/3.3.3/$JAR"
-    download "$LURL" "$WORK/$JAR" && download "$LURL.sha512" "$WORK/$JAR.sha512" \
-      || die "Не удалось скачать $JAR с Maven Central. Проверьте сеть."
+    if ! download "$LURL" "$WORK/$JAR" || ! download "$LURL.sha512" "$WORK/$JAR.sha512"; then
+      die "Не удалось скачать $JAR с Maven Central. Проверьте сеть."
+    fi
     [[ "$(sha512sum "$WORK/$JAR" | awk '{print $1}')" == "$(awk 'NR == 1 {print $1}' "$WORK/$JAR.sha512")" ]] \
       || die "SHA-512 $JAR не совпадает. Установка остановлена."
     unzip -qjo "$WORK/$JAR" 'linux/arm64/*.so' -d "$BUNDLE/natives"
@@ -114,11 +97,237 @@ if [[ "$ARCH" == aarch64 ]]; then
   ok 'LWJGL для arm64 на месте, SHA-512 совпадает с Maven Central'
 fi
 
+cat > "$WORK/Installer.java" <<'INSTALLER_JAVA'
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
+import java.nio.file.*;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.regex.Pattern;
+import java.util.zip.ZipFile;
+
+class Installer {
+    public static void main(String[] args) throws Exception {
+        Path source = Path.of(args[1]);
+        switch (args[0]) {
+            case "manifest" -> System.out.println(new Manifest(Files.readString(source)).size());
+            case "icon" -> {
+                if (!extractIcon(source, Path.of(args[2]))) System.exit(1);
+            }
+            case "recover", "publish" -> update(source, args.length == 3 ? Path.of(args[2]) : null);
+            default -> throw new IllegalArgumentException(args[0]);
+        }
+    }
+
+    // Read JSON tokens and match only the root launcher.size path.
+    private static final class Manifest {
+        private static final Pattern TOKEN = Pattern.compile(
+            "[ \\t\\r\\n]*(" +
+            "\"(?:[^\"\\\\\\x00-\\x1f]|\\\\(?:[\"\\\\/bfnrt]|u[0-9a-fA-F]{4}))*+\"|" +
+            "-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null|[{}\\[\\],:])");
+        private final java.util.regex.Matcher tokens;
+        private final String input;
+        private int offset;
+        private String token;
+        private long size;
+        private boolean launcherSeen;
+
+        Manifest(String input) {
+            this.input = input;
+            tokens = TOKEN.matcher(input);
+            advance();
+        }
+
+        long size() {
+            require("{".equals(token));
+            value(1, 0);
+            require(token == null && offset == input.length() && size > 0);
+            return size;
+        }
+
+        private void advance() {
+            if (tokens.region(offset, input.length()).lookingAt()) {
+                token = tokens.group(1);
+                offset = tokens.end();
+            } else {
+                if (input.substring(offset).chars().allMatch(c -> c == ' ' || c == '\t' || c == '\n' || c == '\r')) {
+                    offset = input.length();
+                }
+                token = null;
+            }
+        }
+
+        private boolean take(String expected) {
+            if (!expected.equals(token)) return false;
+            advance();
+            return true;
+        }
+
+        private void value(int path, int depth) {
+            require(depth < 64 && token != null);
+            if (path == 3) {
+                require(size == 0 && token.matches("[1-9][0-9]*"));
+                size = Long.parseLong(token);
+                advance();
+            } else if (take("{")) {
+                if (take("}")) return;
+                do {
+                    require(token != null && token.startsWith("\""));
+                    String key = token;
+                    advance();
+                    require(take(":"));
+                    if (path == 1 && key.equals("\"launcher\"")) {
+                        require(!launcherSeen && "{".equals(token));
+                        launcherSeen = true;
+                        value(2, depth + 1);
+                    } else {
+                        value(path == 2 && key.equals("\"size\"") ? 3 : 0, depth + 1);
+                    }
+                } while (take(","));
+                require(take("}"));
+            } else if (take("[")) {
+                if (take("]")) return;
+                do {
+                    value(0, depth + 1);
+                } while (take(","));
+                require(take("]"));
+            } else {
+                require(!",:]}".contains(token));
+                advance();
+            }
+        }
+
+        private static void require(boolean ok) {
+            if (!ok) throw new IllegalArgumentException("Некорректный манифест лаунчера.");
+        }
+    }
+
+    private static boolean extractIcon(Path jarPath, Path output) throws IOException {
+        byte[] icon;
+        try (ZipFile jar = new ZipFile(jarPath.toFile())) {
+            var entry = jar.getEntry("loliland/application/public/favicon.ico");
+            if (entry == null) return false;
+            try (var stream = jar.getInputStream(entry)) {
+                icon = stream.readAllBytes();
+            }
+        }
+        if (icon.length < 6) return false;
+        ByteBuffer data = ByteBuffer.wrap(icon).order(ByteOrder.LITTLE_ENDIAN);
+        if (data.getShort(0) != 0 || data.getShort(2) != 1) return false;
+        int count = Short.toUnsignedInt(data.getShort(4));
+        if (6 + 16 * count > icon.length) return false;
+        for (int i = count - 1; i >= 0; i--) {
+            int entry = 6 + 16 * i;
+            int length = data.getInt(entry + 8);
+            int start = data.getInt(entry + 12);
+            if (length < 8 || start < 0 || (long) start + length > icon.length) continue;
+            if (data.getLong(start) != 0x0a1a0a0d474e5089L) continue;
+            Files.write(output, Arrays.copyOfRange(icon, start, start + length));
+            return true;
+        }
+        return false;
+    }
+
+    private static void update(Path share, Path work) throws IOException {
+        Path app = share.resolve("loliland-launcher");
+        Path desktop = share.resolve("applications/loliland.desktop");
+        Path journal = share.resolve(".loliland-update");
+        try (var channel = FileChannel.open(share.resolve(".loliland-install.lock"),
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                var lock = channel.tryLock()) {
+            if (lock == null) throw new IOException("Другой установщик LoliLand уже публикует обновление.");
+            recover(journal, app, desktop);
+            if (work == null) return;
+
+            Files.createDirectory(journal);
+            try {
+                if (!exists(app)) Files.createFile(journal.resolve("new-app"));
+                if (exists(desktop)) {
+                    Files.copy(desktop, journal.resolve("desktop"), LinkOption.NOFOLLOW_LINKS, StandardCopyOption.COPY_ATTRIBUTES);
+                } else {
+                    Files.createFile(journal.resolve("new-desktop"));
+                }
+                Files.createFile(journal.resolve("ready"));
+                if (exists(app)) move(app, journal.resolve("app"));
+                move(work.resolve("loliland-launcher"), app);
+                move(work.resolve("loliland.desktop"), desktop);
+                move(journal, work.resolve("committed"));
+            } catch (IOException failure) {
+                try {
+                    recover(journal, app, desktop);
+                } catch (IOException rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
+                }
+                throw failure;
+            }
+        }
+    }
+
+    // Rollback is safe to repeat if the installer stops during recovery.
+    private static void recover(Path journal, Path app, Path desktop) throws IOException {
+        if (!exists(journal)) return;
+        if (exists(journal.resolve("ready"))) {
+            Path previousApp = journal.resolve("app");
+            if (exists(previousApp)) {
+                removeTree(app);
+                move(previousApp, app);
+            } else if (exists(journal.resolve("new-app"))) {
+                removeTree(app);
+            }
+            Path previousDesktop = journal.resolve("desktop");
+            if (exists(previousDesktop)) {
+                move(previousDesktop, desktop);
+            } else if (exists(journal.resolve("new-desktop"))) {
+                Files.deleteIfExists(desktop);
+            }
+        }
+        removeTree(journal);
+    }
+
+    private static boolean exists(Path path) {
+        return Files.exists(path, LinkOption.NOFOLLOW_LINKS);
+    }
+
+    private static void move(Path source, Path destination) throws IOException {
+        Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    private static void removeTree(Path root) throws IOException {
+        if (!exists(root)) return;
+        try (var paths = Files.walk(root)) {
+            for (Path path : (Iterable<Path>) paths.sorted(Comparator.reverseOrder())::iterator) Files.delete(path);
+        }
+    }
+}
+INSTALLER_JAVA
+"$JAVA_HOME_LOCAL/bin/java" -m jdk.compiler/com.sun.tools.javac.Main -d "$WORK" "$WORK/Installer.java" \
+  || die 'Не удалось собрать вспомогательную программу установки.'
+install_helper() { "$JAVA_HOME_LOCAL/bin/java" -cp "$WORK" Installer "$@"; }
+install_helper recover "$SHARE" || die 'Не удалось восстановить предыдущую установку.'
+step 2 'Лаунчер LoliLand'
+download "$SOURCE/api/updater/win64" "$WORK/manifest.json" \
+  || die 'Не удалось получить манифест LoliLand. Проверьте сеть и доступность сервера.'
+SIZE="$(install_helper manifest "$WORK/manifest.json")" \
+  || die 'Сервер вернул некорректный манифест лаунчера.'
+ok 'Манифест получен'
+printf '  Скачиваю launcher.jar (%s МБ)…\n' "$((SIZE / 1048576))"
+download "$SOURCE/api/updater/load/launcher" "$BUNDLE/launcher.jar" --progress-bar \
+  || die 'Не удалось скачать launcher.jar. Проверьте сеть и доступность сервера.'
+[[ "$(stat -c %s "$BUNDLE/launcher.jar")" == "$SIZE" ]] || die 'Размер launcher.jar не совпадает с манифестом.'
+ok 'Размер совпадает с манифестом'
+unzip -tq "$BUNDLE/launcher.jar" >/dev/null || die 'Архив launcher.jar повреждён.'
+unzip -p "$BUNDLE/launcher.jar" META-INF/MANIFEST.MF | tr -d '\r' | grep -x 'Main-Class: loliland.launcher.app.Main' >/dev/null \
+  || die 'В JAR не найден основной класс лаунчера LoliLand.'
+ok 'Архив цел, лаунчер на месте'
+
 step 3 'Сборка LoliLand'
 printf '%s\n' "$RUNTIME" > "$BUNDLE/runtime-name.txt"
 cat > "$BUNDLE/loliland" <<'LAUNCH'
 #!/bin/bash
 set -euo pipefail
+umask 077
 APP="$(dirname -- "$(readlink -f -- "$0")")"
 RUNTIME="$(< "$APP/runtime-name.txt")"
 export JAVA_HOME="$APP/runtimes/$RUNTIME"
@@ -127,9 +336,19 @@ export PATH="$JAVA_HOME/bin:$PATH"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/LoliLand"
 LOG="$DATA/linux-app.log"
 # The game JVM inherits this from the launcher; LWJGL then loads our arm64 natives.
-# shortcut: breaks if the install path has spaces, quote it if anyone hits that.
-[[ ! -d "$APP/natives" ]] || export JAVA_TOOL_OPTIONS="-Dorg.lwjgl.librarypath=$APP/natives ${JAVA_TOOL_OPTIONS:-}"
+if [[ -d "$APP/natives" ]]; then
+  # HotSpot accepts either quote delimiter and preserves the other one.
+  if [[ "$APP" != *'"'* ]]; then
+    export JAVA_TOOL_OPTIONS="-Dorg.lwjgl.librarypath=\"$APP/natives\" ${JAVA_TOOL_OPTIONS:-}"
+  elif [[ "$APP" != *"'"* ]]; then
+    export JAVA_TOOL_OPTIONS="-Dorg.lwjgl.librarypath='$APP/natives' ${JAVA_TOOL_OPTIONS:-}"
+  else
+    printf 'Путь к библиотекам LWJGL содержит оба вида кавычек.\n' >&2
+    exit 1
+  fi
+fi
 mkdir -p "$DATA"
+chmod go-rwx -- "$DATA"
 cd -- "$DATA"
 # Keep only the current and the previous launch.
 [[ ! -f "$LOG" ]] || mv -f -- "$LOG" "$LOG.1"
@@ -139,7 +358,7 @@ LAUNCH
 chmod +x "$BUNDLE/loliland"
 bash -n "$BUNDLE/loliland"
 
-# Keyboard fix, compiled here from source with the JBR's own javac.
+# Launcher fixes, compiled here from source with the JBR's own javac.
 cat > "$WORK/LoliLand.java" <<'JAVA'
 import java.awt.AWTEvent;
 import java.awt.Component;
@@ -148,7 +367,12 @@ import java.awt.Window;
 import java.awt.event.WindowEvent;
 import javax.swing.SwingUtilities;
 import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -161,10 +385,40 @@ import java.util.Map;
  */
 public final class LoliLand {
     public static void main(String[] args) throws Exception {
+        migrateStorage();
         Thread fix = new Thread(LoliLand::focusBrowserWithWindow, "keyboard-focus-fix");
         fix.setDaemon(true);
         fix.start();
         loliland.launcher.app.Main.main(args);
+    }
+
+    private static void migrateStorage() throws java.io.IOException {
+        Path storage = Path.of("Binaries", "launcher-data", "storage.txt");
+        if (!Files.isRegularFile(storage)) return;
+        Files.setPosixFilePermissions(storage, PosixFilePermissions.fromString("rw-------"));
+        String contents = Files.readString(storage);
+        String cleaned = contents.replaceAll("(?m)^auth\\.password:[^\\r\\n]*(?:\\r?\\n|$)", "");
+        if (contents.equals(cleaned)) return;
+        Path temp = Files.createTempFile(storage.getParent(), ".storage-", ".tmp");
+        try {
+            Files.writeString(temp, cleaned);
+            Files.move(temp, storage, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } finally {
+            Files.deleteIfExists(temp);
+        }
+    }
+
+    public static List<String> normalizeGameArguments(List<String> arguments) {
+        List<String> normalized = null;
+        for (int i = 0; i < arguments.size(); i++) {
+            String argument = arguments.get(i);
+            String replacement = argument.replace("\"${auth_player_name}\"", "${auth_player_name}");
+            if (!argument.equals(replacement)) {
+                if (normalized == null) normalized = new ArrayList<>(arguments);
+                normalized.set(i, replacement);
+            }
+        }
+        return normalized == null ? arguments : normalized;
     }
 
     private static void focusBrowserWithWindow() {
@@ -218,23 +472,139 @@ public final class LoliLand {
     }
 }
 JAVA
+cat > "$WORK/PatchLauncher.java" <<'JAVA'
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
+import java.util.jar.JarFile;
+import jdk.internal.org.objectweb.asm.ClassReader;
+import jdk.internal.org.objectweb.asm.ClassVisitor;
+import jdk.internal.org.objectweb.asm.ClassWriter;
+import jdk.internal.org.objectweb.asm.Label;
+import jdk.internal.org.objectweb.asm.MethodVisitor;
+import jdk.internal.org.objectweb.asm.Opcodes;
+
+public final class PatchLauncher {
+    private static final String CONFIG_CLASS = "loliland/launcher/app/data/ClientLaunchConfig.class";
+
+    public static void main(String[] args) throws Exception {
+        Path classes = Path.of(args[1]);
+        patchNickname(args[0], classes);
+        patchPasswordStorage(args[0], classes);
+    }
+
+    private static void patchNickname(String jarPath, Path classes) throws Exception {
+        // ProcessBuilder on Linux passes literal quotes from the launch template
+        // to Minecraft. Normalize the nickname placeholder before substitution.
+        ClassReader config;
+        try (JarFile jar = new JarFile(jarPath)) {
+            var entry = jar.getJarEntry(CONFIG_CLASS);
+            if (entry == null) {
+                System.err.println("Предупреждение: класс настроек игры изменился, исправление ника пропущено.");
+                return;
+            }
+            try (var input = jar.getInputStream(entry)) {
+                config = new ClassReader(input);
+            }
+        }
+        ClassWriter patched = new ClassWriter(config, 0);
+        boolean[] changed = { false };
+        config.accept(new ClassVisitor(Opcodes.ASM8, patched) {
+            @Override
+            public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
+                MethodVisitor method = super.visitMethod(access, name, descriptor, signature, exceptions);
+                if (!name.equals("getGameArguments") || !descriptor.equals("()Ljava/util/List;")) return method;
+                return new MethodVisitor(Opcodes.ASM8, method) {
+                    @Override
+                    public void visitInsn(int opcode) {
+                        if (opcode == Opcodes.ARETURN) {
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "LoliLand", "normalizeGameArguments",
+                                "(Ljava/util/List;)Ljava/util/List;", false);
+                            changed[0] = true;
+                        }
+                        super.visitInsn(opcode);
+                    }
+                };
+            }
+        }, 0);
+        if (!changed[0]) {
+            System.err.println("Предупреждение: метод параметров игры изменился, исправление ника пропущено.");
+            return;
+        }
+        writeClass(classes, CONFIG_CLASS, patched);
+    }
+
+    private static void patchPasswordStorage(String jarPath, Path classes) throws Exception {
+        int[] writes = { 0 };
+        try (JarFile jar = new JarFile(jarPath)) {
+            for (var entries = jar.entries(); entries.hasMoreElements();) {
+                var entry = entries.nextElement();
+                String name = entry.getName();
+                if (!name.startsWith("loliland/launcher/app/") || !name.endsWith(".class")) continue;
+                byte[] bytes;
+                try (var input = jar.getInputStream(entry)) {
+                    bytes = input.readAllBytes();
+                }
+                if (!new String(bytes, StandardCharsets.ISO_8859_1).contains("storage.txt")) continue;
+                ClassReader original = new ClassReader(bytes);
+                ClassWriter patched = new ClassWriter(original, 0);
+                int before = writes[0];
+                original.accept(new ClassVisitor(Opcodes.ASM8, patched) {
+                    @Override
+                    public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
+                        MethodVisitor method = super.visitMethod(access, name, descriptor, signature, exceptions);
+                        if ((access & Opcodes.ACC_STATIC) != 0 || !descriptor.equals("(Ljava/lang/String;Ljava/lang/Object;)V")) {
+                            return method;
+                        }
+                        writes[0]++;
+                        return new MethodVisitor(Opcodes.ASM8, method) {
+                            @Override
+                            public void visitCode() {
+                                super.visitCode();
+                                Label keep = new Label();
+                                super.visitLdcInsn("auth.password");
+                                super.visitVarInsn(Opcodes.ALOAD, 1);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "equals",
+                                    "(Ljava/lang/Object;)Z", false);
+                                super.visitJumpInsn(Opcodes.IFEQ, keep);
+                                super.visitInsn(Opcodes.RETURN);
+                                super.visitLabel(keep);
+                                super.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
+                            }
+
+                            @Override
+                            public void visitMaxs(int stack, int locals) {
+                                super.visitMaxs(Math.max(stack, 2), locals);
+                            }
+                        };
+                    }
+                }, 0);
+                if (writes[0] != before) writeClass(classes, name, patched);
+            }
+        }
+        if (writes[0] != 1) throw new IllegalStateException("Изменился код сохранения пароля: " + writes[0]);
+    }
+
+    private static void writeClass(Path classes, String name, ClassWriter patched) throws Exception {
+        Path output = classes.resolve(name);
+        Files.createDirectories(output.getParent());
+        Files.write(output, patched.toByteArray());
+    }
+}
+JAVA
 "$JAVA_HOME_LOCAL/bin/java" -m jdk.compiler/com.sun.tools.javac.Main -nowarn \
   -cp "$BUNDLE/launcher.jar" -d "$BUNDLE/classes" "$WORK/LoliLand.java" \
   || die 'Не удалось собрать исправление клавиатуры.'
+# Build the replacement class from the downloaded JAR without modifying the JAR itself.
+ASM_EXPORT='java.base/jdk.internal.org.objectweb.asm=ALL-UNNAMED'
+"$JAVA_HOME_LOCAL/bin/java" --add-exports "$ASM_EXPORT" \
+  "$WORK/PatchLauncher.java" "$BUNDLE/launcher.jar" "$BUNDLE/classes" \
+  || die 'Не удалось применить исправления ника и хранения пароля.'
 
-# The launcher's favicon.ico ends with a 256px PNG entry; desktops load PNG everywhere, ICO not always.
-unzip -p "$BUNDLE/launcher.jar" loliland/application/public/favicon.ico > "$WORK/favicon.ico"
-ico_u() { od -An -t "u$1" -j "$2" -N "$1" "$WORK/favicon.ico" | tr -d ' '; }
-COUNT="$(ico_u 2 4)"
-ENTRY=$((6 + 16 * (COUNT - 1)))
-PNG_SIZE="$(ico_u 4 $((ENTRY + 8)))"
-# head reads the file itself and tail drains the pipe, so no SIGPIPE under pipefail.
-head -c "$(( $(ico_u 4 $((ENTRY + 12))) + PNG_SIZE ))" "$WORK/favicon.ico" | tail -c "$PNG_SIZE" > "$BUNDLE/loliland.png"
-ICON="$APP/loliland.png"
-if [[ "$(od -An -tx1 -N4 "$BUNDLE/loliland.png" | tr -d ' ')" != 89504e47 ]]; then
-  rm -f "$BUNDLE/loliland.png"
-  cp "$WORK/favicon.ico" "$BUNDLE/loliland.ico"
-  ICON="$APP/loliland.ico"
+# Prefer the embedded PNG and fall back to a desktop theme icon.
+ICON=applications-games
+if install_helper icon "$BUNDLE/launcher.jar" "$BUNDLE/loliland.png"; then
+  ICON="$APP/loliland.png"
 fi
 
 printf 'Launcher source: %s/api/updater/load/launcher\nRuntime source: %s\nRuntime SHA-512: %s\n' \
@@ -255,13 +625,8 @@ DESK
   || die 'Ярлык LoliLand получился некорректным (ошибки выше).'
 ok 'Приложение собрано'
 check_old_app
-# The old app goes into WORK, so the EXIT trap deletes it after a successful swap.
-if [[ -e "$APP" ]]; then
-  mv -- "$APP" "$WORK/old"
-  ok 'Предыдущая версия LoliLand заменена'
-fi
-mv -- "$BUNDLE" "$APP" || { mv -- "$WORK/old" "$APP" 2>/dev/null; die 'Не удалось установить новое приложение; старое восстановлено.'; }
-mv -f -- "$WORK/loliland.desktop" "$DESKTOP"
+install_helper publish "$SHARE" "$WORK" || die 'Не удалось опубликовать лаунчер.'
+[[ ! -e "$WORK/committed/app" ]] || ok 'Предыдущая версия LoliLand заменена'
 ! command -v update-desktop-database >/dev/null || update-desktop-database "$SHARE/applications" 2>/dev/null || true
 
 printf '\n%s%s✓ Готово:%s %s\n\n' "$G" "$B" "$N" "$APP"
